@@ -139,16 +139,41 @@ app.post('/api/proxy', async (req, res) => {
     }
 });
 
-// HTML 처리 함수
+// HTML 처리 함수 (더 강력한 iframe 차단 우회)
 function processHtml(html, baseUrl) {
     const $ = cheerio.load(html);
     const urlObj = new URL(baseUrl);
     const baseHost = `${urlObj.protocol}//${urlObj.host}`;
 
+    // 모든 iframe 차단 스크립트 제거
+    $('script').each(function() {
+        const scriptContent = $(this).html();
+        if (scriptContent && (
+            scriptContent.includes('X-Frame-Options') ||
+            scriptContent.includes('framebusting') ||
+            scriptContent.includes('top.location') ||
+            scriptContent.includes('parent.location') ||
+            scriptContent.includes('window.top') ||
+            scriptContent.includes('self != top')
+        )) {
+            $(this).remove();
+        }
+    });
+
+    // CSP meta 태그 제거
+    $('meta[http-equiv*="Content-Security-Policy"]').remove();
+    $('meta[http-equiv*="X-Frame-Options"]').remove();
+
+    // iframe 허용 meta 태그 추가
+    $('head').prepend(`
+        <meta http-equiv="Content-Security-Policy" content="frame-ancestors *; script-src * 'unsafe-inline' 'unsafe-eval'; object-src *;">
+        <meta http-equiv="X-Frame-Options" content="ALLOWALL">
+    `);
+
     // 모든 링크를 프록시를 통하도록 수정
     $('a[href]').each(function() {
         const href = $(this).attr('href');
-        if (href) {
+        if (href && !href.startsWith('javascript:') && !href.startsWith('#') && !href.startsWith('mailto:')) {
             const absoluteUrl = resolveUrl(href, baseUrl);
             $(this).attr('href', `/api/proxy?url=${encodeURIComponent(absoluteUrl)}`);
             $(this).attr('target', '_parent');
@@ -158,7 +183,7 @@ function processHtml(html, baseUrl) {
     // 이미지 소스 수정
     $('img[src]').each(function() {
         const src = $(this).attr('src');
-        if (src) {
+        if (src && !src.startsWith('data:')) {
             const absoluteUrl = resolveUrl(src, baseUrl);
             $(this).attr('src', `/api/proxy?url=${encodeURIComponent(absoluteUrl)}`);
         }
@@ -185,7 +210,7 @@ function processHtml(html, baseUrl) {
     // 폼 액션 수정
     $('form[action]').each(function() {
         const action = $(this).attr('action');
-        if (action) {
+        if (action && !action.startsWith('javascript:')) {
             const absoluteUrl = resolveUrl(action, baseUrl);
             $(this).attr('action', `/api/proxy?url=${encodeURIComponent(absoluteUrl)}`);
         }
@@ -196,20 +221,43 @@ function processHtml(html, baseUrl) {
         $('head').prepend(`<base href="${baseHost}/">`);
     }
 
-    // 프록시 정보 주입
+    // 강력한 iframe 허용 스크립트 주입
     $('head').append(`
         <script>
-            // 프록시 헬퍼 함수들
-            window.PROXY_BASE_URL = '${baseHost}';
-            window.PROXY_CURRENT_URL = '${baseUrl}';
-            
-            // 새 창에서 열기 방지
-            window.open = function(url, name, specs) {
-                if (url) {
-                    window.location.href = '/api/proxy?url=' + encodeURIComponent(url);
-                }
-                return null;
-            };
+            // 모든 iframe 차단 방지
+            (function() {
+                // framebusting 방지
+                try {
+                    window.top.location = window.location;
+                } catch(e) {}
+                
+                try {
+                    if (window.top !== window.self) {
+                        window.top.location = window.location;
+                    }
+                } catch(e) {}
+
+                // 프록시 정보 설정
+                window.PROXY_BASE_URL = '${baseHost}';
+                window.PROXY_CURRENT_URL = '${baseUrl}';
+                
+                // 새 창 열기 override
+                const originalOpen = window.open;
+                window.open = function(url, name, specs) {
+                    if (url) {
+                        const proxyUrl = '/api/proxy?url=' + encodeURIComponent(url);
+                        return originalOpen.call(this, proxyUrl, name, specs);
+                    }
+                    return null;
+                };
+
+                // location 변경 감지 및 프록시 적용
+                const originalReplace = window.location.replace;
+                window.location.replace = function(url) {
+                    const proxyUrl = '/api/proxy?url=' + encodeURIComponent(url);
+                    return originalReplace.call(this, proxyUrl);
+                };
+            })();
         </script>
     `);
 
