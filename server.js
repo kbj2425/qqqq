@@ -263,21 +263,159 @@ function isBlockedUrl(url) {
     }
 }
 
-// GET 요청도 처리 (직접 URL 접근용)
-app.get('/api/proxy', async (req, res) => {
+// 전체 페이지 프록시 (X-Frame-Options 우회)
+app.get('/proxy-page', async (req, res) => {
     const { url } = req.query;
     
     if (!url) {
-        return res.status(400).json({
-            success: false,
-            error: 'URL 파라미터가 필요합니다.'
-        });
+        return res.status(400).send(`
+            <h1>❌ 오류</h1>
+            <p>URL 파라미터가 필요합니다.</p>
+            <p><a href="/">홈으로 돌아가기</a></p>
+        `);
     }
 
-    // POST 요청으로 변환하여 처리
-    req.body = { url, method: 'GET' };
-    return app._router.handle(req, res);
+    if (!isValidUrl(url)) {
+        return res.status(400).send(`
+            <h1>❌ 유효하지 않은 URL</h1>
+            <p>올바른 URL을 입력해주세요: <strong>${url}</strong></p>
+            <p><a href="/">홈으로 돌아가기</a></p>
+        `);
+    }
+
+    try {
+        console.log(`전체 페이지 프록시 요청: ${url}`);
+
+        const config = {
+            method: 'GET',
+            url: url,
+            timeout: 30000,
+            maxRedirects: 5,
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'ko-KR,ko;q=0.8,en-US;q=0.5,en;q=0.3',
+                'Accept-Encoding': 'gzip, deflate',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1'
+            },
+            responseType: 'arraybuffer'
+        };
+
+        const response = await axios(config);
+        const contentType = response.headers['content-type'] || 'text/html';
+
+        if (contentType.includes('text/html')) {
+            let htmlContent = response.data.toString('utf-8');
+            
+            // 프록시 처리된 HTML
+            htmlContent = processHtmlForFullPage(htmlContent, url);
+            
+            // 헤더 설정 (X-Frame-Options 제거)
+            res.set({
+                'Content-Type': 'text/html; charset=utf-8',
+                'Cache-Control': 'no-cache',
+                'X-Frame-Options': 'ALLOWALL'
+            });
+
+            res.send(htmlContent);
+        } else {
+            // HTML이 아닌 경우 원본 그대로 전송
+            res.set('Content-Type', contentType);
+            res.send(response.data);
+        }
+
+    } catch (error) {
+        console.error('전체 페이지 프록시 에러:', error.message);
+        
+        res.status(500).send(`
+            <h1>🚨 연결 실패</h1>
+            <p><strong>${url}</strong>에 연결할 수 없습니다.</p>
+            <p>오류: ${error.message}</p>
+            <br>
+            <p>💡 다른 방법들:</p>
+            <ul>
+                <li>URL이 정확한지 확인해보세요</li>
+                <li>https:// 를 붙여보세요</li>
+                <li>사이트가 일시적으로 다운되었을 수 있습니다</li>
+            </ul>
+            <p><a href="/">← 홈으로 돌아가기</a></p>
+        `);
+    }
 });
+
+// 전체 페이지용 HTML 처리 함수
+function processHtmlForFullPage(html, baseUrl) {
+    const $ = cheerio.load(html);
+    const urlObj = new URL(baseUrl);
+    const baseHost = `${urlObj.protocol}//${urlObj.host}`;
+
+    // 상단에 프록시 바 추가
+    const proxyBar = `
+        <div style="position: fixed; top: 0; left: 0; right: 0; background: linear-gradient(45deg, #667eea, #764ba2); 
+                    color: white; padding: 10px; z-index: 999999; font-family: Arial; font-size: 14px;
+                    box-shadow: 0 2px 10px rgba(0,0,0,0.3);">
+            <div style="max-width: 1200px; margin: 0 auto; display: flex; align-items: center; justify-content: space-between;">
+                <div>
+                    🛡️ <strong>SecureProxy</strong> - 현재 접속: <span style="background: rgba(255,255,255,0.2); padding: 2px 8px; border-radius: 4px;">${baseUrl}</span>
+                </div>
+                <div>
+                    <a href="/" style="color: white; text-decoration: none; background: rgba(255,255,255,0.2); padding: 5px 10px; border-radius: 4px; margin-left: 10px;">홈으로</a>
+                    <button onclick="window.location.reload()" style="background: rgba(255,255,255,0.2); border: none; color: white; padding: 5px 10px; border-radius: 4px; margin-left: 10px; cursor: pointer;">새로고침</button>
+                </div>
+            </div>
+        </div>
+        <div style="height: 50px;"></div>
+    `;
+
+    $('body').prepend(proxyBar);
+
+    // 모든 링크를 프록시를 통하도록 수정
+    $('a[href]').each(function() {
+        const href = $(this).attr('href');
+        if (href && !href.startsWith('javascript:') && !href.startsWith('#')) {
+            const absoluteUrl = resolveUrl(href, baseUrl);
+            $(this).attr('href', `/proxy-page?url=${encodeURIComponent(absoluteUrl)}`);
+        }
+    });
+
+    // 이미지, CSS, JS도 프록시를 통하도록 수정
+    $('img[src]').each(function() {
+        const src = $(this).attr('src');
+        if (src && !src.startsWith('data:')) {
+            const absoluteUrl = resolveUrl(src, baseUrl);
+            $(this).attr('src', `/api/proxy?url=${encodeURIComponent(absoluteUrl)}`);
+        }
+    });
+
+    $('link[rel="stylesheet"]').each(function() {
+        const href = $(this).attr('href');
+        if (href) {
+            const absoluteUrl = resolveUrl(href, baseUrl);
+            $(this).attr('href', `/api/proxy?url=${encodeURIComponent(absoluteUrl)}`);
+        }
+    });
+
+    $('script[src]').each(function() {
+        const src = $(this).attr('src');
+        if (src) {
+            const absoluteUrl = resolveUrl(src, baseUrl);
+            $(this).attr('src', `/api/proxy?url=${encodeURIComponent(absoluteUrl)}`);
+        }
+    });
+
+    // 폼 액션 수정
+    $('form[action]').each(function() {
+        const action = $(this).attr('action');
+        if (action && !action.startsWith('javascript:')) {
+            const absoluteUrl = resolveUrl(action, baseUrl);
+            $(this).attr('action', `/proxy-page?url=${encodeURIComponent(absoluteUrl)}`);
+        }
+    });
+
+    return $.html();
+}
 
 // 메인 페이지
 app.get('/', (req, res) => {
